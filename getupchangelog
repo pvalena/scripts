@@ -1,0 +1,155 @@
+#!/bin/bash
+#
+# ./getupchangelog [all options are passed to dnf]
+#
+#   Print new changelog entries for packages selected for an update.
+#     `dnf update [options]`
+#
+#   Warning: downloads one rpm package for every srpm of a selected update.
+#     `dnf update -y --downloadonly`
+#
+#   If DEBUG env is nonempty, output will not be complete
+#     and additional output will be present
+#
+#   In case of failure try running command below and then retry.
+#     `dnf -q clean all`
+#
+
+# Magic constant of before context for grep
+MC=10000
+
+# Every failure should be handled
+set -e
+
+# Use: error "$LINENO: <error_message>."
+error () {
+  echo -e " => Error on line $1" >&2
+  exit "${2:-1}"
+}
+trap 'error ${LINENO}' 1 2 3 4 5 6 7 8 10 11 12 13 14 15 16
+
+warn () {
+  echo -e " => Warning on line $1\n" >&2
+}
+
+debug () {
+  [[ -n "$DEBUG" ]] && echo -e "DEBUG: $@" || :
+}
+
+# packages to update
+up_pkgs () {
+  # Add "--refresh" below if you want to force repository sync every time
+  local O="$(
+    dnf -q check-update "$@" 2>/dev/null | cut -d ' ' -f1
+  )"
+
+  local w='^Obsoleting$'
+  local f=cat
+  [[ -n "$DEBUG" ]] && f=head
+
+  {
+    echo "$O" \
+      | grep -B $MC "$w" \
+      | grep -v "$w" \
+      || echo "$O"
+  } | grep -vE '^\s*$' \
+    | grep -v '\.src$' \
+    | sort -u \
+    | $f
+}
+
+########
+
+debug "DEBUGing in progress..."
+
+main () {
+  # must run as root due to rpm package download
+  [[ "`whoami`" == "root" ]] || error "$LINENO: you have to run this script as root (with sudo)"
+
+  # S - array[srpm]="list of pkgs"
+  declare -A S
+
+  ##up_pkgs | \
+  while read pkg; do
+    srpm="$(
+      dnf -Cq repoquery -s --latest-limit 1 "$pkg" 2>/dev/null
+    )" || error "$LINENO: failed to get srpm for '$pkg'."
+    S[${srpm}]="$pkg ${S[$srpm]}"
+  done < <( up_pkgs "$@" )
+
+  for srpm in "${!S[@]}" ; do
+    debug "$srpm =" "${S[$srpm]}"
+
+    # C - before update (current)
+    # A - after update
+    # O - nvr list to output
+    local C A O=
+
+    # for .. srpm
+    while read pkg; do
+      [[ -z "$pkg" ]] && error "$LINENO: no package to update."
+
+      C="$(
+        rpm -q "$pkg"
+      )" || error "$LINENO: package '$pkg' is not installed."
+      C="`rev <<< "$C" | cut -d'.' -f2- | rev`"
+      [[ -z "$C" ]] && error "$LINENO: failed to get nvr for current-pkg '$pkg'."
+
+      A="$(
+        dnf -Cq repoquery --qf "%{name}-%{version}-%{release}" --latest-limit 1 "$pkg" 2>/dev/null
+      )" || error "$LINENO: after-update package not found."
+      A="`head -1 <<< "$A" | rev | cut -d'.' -f1- | rev`"
+      [[ -z "$A" ]] && error "$LINENO: failed to get nvr for update-pkg '$pkg'."
+
+      O="$O|=== $C --> $A ==="
+    done < <(tr -s ' ' '\n' <<< "${S[$srpm]}" | sort -u)
+    tr -s '|' '\n' <<< "$O" | grep -v '^$' | sort -u
+
+    debug "comparing changelogs of $C --> $A"
+
+    # I do not know how to avoid downloading updated packages first.
+    ls /var/cache/dnf/*/packages/$A*rpm &>/dev/null || {
+      debug "downloading rpm file for pkg '$A'"
+      local T="$(
+        dnf -C update -y --downloadonly "$A" 2>&1
+      )" || error "$LINENO, failed to download rpm file for pkg '$A':\n$T"
+      debug "<<<\n$T\n>>>"
+    }
+
+    # Ar - rpm file of A
+    local Ar="$(
+      ls /var/cache/dnf/*/packages/$A*rpm 2>/dev/null | head -1
+    )" || error "$LINENO: failed to list rpm files for pkg '$A':\n$Ar"
+    [[ -n "$Ar" && $(wc -l <<< "$Ar") -eq 1 && -r "$Ar" ]] || {
+      warn "$LINENO: invalid rpm file for package '$A':\n$Ar"
+      continue
+    }
+    debug "Ar = $Ar"
+
+    # Ac - changelog from Ar
+    local Ac="$(
+      rpm -q --changelog -p "$Ar" 2>/dev/null
+    )" || error "$LINENO: failed to get changelog from '$Ar'."
+    debug "Ac | head >>>\n`head <<< "$Ac"`\n<<<"
+
+    # x - line of *changelog for C
+    while read x; do
+      # M - match
+      local M=
+
+      # y - line of Ac
+      O="$(
+        while read y; do
+          # stops on match
+          grep -v "^$x" <<< "$y" || { M=y ; exit 0 ; }
+        done <<< "$Ac"
+        exit 1
+      )" && {
+        echo "$O"
+        break
+      }
+    done < <( rpm -q --changelog "$C" | grep '^*' )
+    echo
+  done
+}
+main "$@"
